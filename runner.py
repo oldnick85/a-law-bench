@@ -12,6 +12,7 @@ import itertools
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -22,15 +23,15 @@ DEFAULT_COMPILERS = {
     "gcc": ["12", "13", "14", "15"],
     "clang": ["16", "17", "18", "19", "20", "21"]
 }
-DEFAULT_OPT_LEVELS = ["O0", "O1", "O2", "O3"]
+DEFAULT_OPT_LEVELS = ["O3"] # ["O0", "O1", "O2", "O3"]
 DEFAULT_ALGORITHMS = ["tabular", "naive"]
 
-# Paths inside container (must match project structure)
 PROJECT_ROOT = Path(__file__).resolve().parent
 ALGORITHMS_DIR = PROJECT_ROOT / "src" / "algorithms"
 BENCHMARKS_DIR = PROJECT_ROOT / "src" / "bench"
 
-def run_combination(compiler, version, opt_level, algorithm, temp_dir):
+
+def run_combination(compiler, version, opt_level, algorithm, temp_dir, verbose):
     """
     Build and run a single combination inside a temporary Docker context.
     Returns a dict with results or None on failure.
@@ -38,11 +39,11 @@ def run_combination(compiler, version, opt_level, algorithm, temp_dir):
     image_tag = f"a-law-bench-{compiler}{version}-{opt_level}-{algorithm}".lower()
     container_name = f"{image_tag}-run"
 
-    # Create a temporary directory with Dockerfile and all sources
+    # Create temporary build context
     context_dir = temp_dir / image_tag
     context_dir.mkdir(parents=True, exist_ok=True)
 
-    # Copy entire project to context
+    # Copy sources
     dest_algorithms = context_dir / "src" / "algorithms"
     dest_benchmarks = context_dir / "src" / "bench"
     shutil.copytree(ALGORITHMS_DIR, dest_algorithms, dirs_exist_ok=True)
@@ -57,7 +58,7 @@ def run_combination(compiler, version, opt_level, algorithm, temp_dir):
         base_image = f"silkeh/clang:{version}"
         compiler_exec = f"clang++-{version}"
 
-    # Generate Dockerfile
+    # Dockerfile
     dockerfile_content = f"""FROM {base_image}
 
 # Install cmake (if not present)
@@ -86,34 +87,39 @@ CMD ["./bench"]
     # Build image
     print(f"\n--- Building {image_tag} ---")
     build_cmd = ["docker", "build", "-t", image_tag, str(context_dir)]
-    try:
-        subprocess.run(build_cmd)
-        #subprocess.run(build_cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Build failed: {e.stderr}")
+    build_result = subprocess.run(build_cmd, capture_output=True, text=True)
+    if verbose:
+        if build_result.stdout:
+            print(build_result.stdout)
+        if build_result.stderr:
+            print(build_result.stderr, file=sys.stderr)
+    if build_result.returncode != 0:
+        print(f"Build failed: {build_result.stderr}")
         return None
 
-    # Run container and capture output
+    # Run container
     print(f"--- Running {image_tag} ---")
     run_cmd = ["docker", "run", "--name", container_name, image_tag]
-    try:
-        result = subprocess.run(run_cmd, check=True, capture_output=True, text=True)
-        output = result.stdout
-    except subprocess.CalledProcessError as e:
-        print(f"Run failed: {e.stderr}")
-        output = e.stdout  # maybe partial JSON?
-    finally:
-        # Remove container
-        subprocess.run(["docker", "rm", container_name], capture_output=True)
+    run_result = subprocess.run(run_cmd, capture_output=True, text=True)
+    if verbose:
+        if run_result.stdout:
+            print(run_result.stdout)
+        if run_result.stderr:
+            print(run_result.stderr, file=sys.stderr)
 
-    # Remove image (cleanup)
+    # Always remove container and image
+    subprocess.run(["docker", "rm", container_name], capture_output=True)
     subprocess.run(["docker", "rmi", image_tag], capture_output=True)
 
-    # Parse JSON output
+    if run_result.returncode != 0:
+        print(f"Run failed: {run_result.stderr}")
+        output = run_result.stdout  # try to parse anyway
+    else:
+        output = run_result.stdout
+
+    # Parse JSON output (expecting last line to be JSON)
     try:
-        # The benchmark prints a single JSON line
         data = json.loads(output.strip().split('\n')[-1])
-        # Add metadata
         data["compiler"] = compiler
         data["version"] = version
         data["opt_level"] = opt_level
@@ -122,6 +128,7 @@ CMD ["./bench"]
         print(f"Failed to parse JSON output: {e}")
         print(f"Output was: {output}")
         return None
+
 
 def main():
     parser = argparse.ArgumentParser(description="Run A-law benchmarks across compilers and optimizations.")
@@ -135,9 +142,11 @@ def main():
                         help="Optimization levels")
     parser.add_argument("--algorithms", nargs="+", default=DEFAULT_ALGORITHMS,
                         help="Algorithm implementations")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Print build and run output")
     args = parser.parse_args()
 
-    # Prepare list of combinations
+    # Build combination list
     combos = []
     for compiler in args.compilers:
         versions = args.gcc_versions if compiler == "gcc" else args.clang_versions
@@ -150,7 +159,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="a-law-bench-") as tmpdir:
         temp_dir = Path(tmpdir)
         for compiler, version, opt, algo in combos:
-            res = run_combination(compiler, version, opt, algo, temp_dir)
+            res = run_combination(compiler, version, opt, algo, temp_dir, args.verbose)
             if res:
                 results.append(res)
 
@@ -158,13 +167,14 @@ def main():
         print("No results obtained.")
         return
 
-    # Print a simple markdown table
+    # Print markdown summary
     print("\n## Summary (samples per second, higher is better)")
     print("| Compiler | Version | Opt | Algorithm | Encode (samples/s) | Decode (samples/s) |")
     print("|----------|---------|-----|-----------|--------------------|--------------------|")
     for r in results:
         print(f"| {r['compiler']} | {r['version']} | {r['opt_level']} | {r['algorithm']} | "
               f"{r['encode']['samples_per_second']:.2e} | {r['decode']['samples_per_second']:.2e} |")
+
 
 if __name__ == "__main__":
     main()

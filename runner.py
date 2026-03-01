@@ -5,12 +5,16 @@ Builds and runs benchmarks for all combinations of:
 - compilers (GCC, Clang versions)
 - optimization levels (O0, O1, O2, O3)
 - algorithms (tabular, naive)
+
+Results can be exported to JSON and visualised with a static plot.
 """
 
 import argparse
+import dataclasses
 import itertools
 import json
 import logging
+import platform
 import shutil
 import subprocess
 import sys
@@ -42,6 +46,7 @@ formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(messag
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+
 # ----------------------------------------------------------------------
 # Dataclasses for benchmark combinations and results
 # ----------------------------------------------------------------------
@@ -53,10 +58,12 @@ class BenchCombination:
     opt_level: str
     algorithm: str
 
+
 @dataclass
 class Throughput:
     """Samples per second measurement."""
     samples_per_second: float
+
 
 @dataclass
 class BenchmarkResult:
@@ -67,6 +74,29 @@ class BenchmarkResult:
     algorithm: str
     encode: Throughput
     decode: Throughput
+    cpu_model: str  # CPU model on which the benchmark ran
+
+
+# ----------------------------------------------------------------------
+# Helper functions
+# ----------------------------------------------------------------------
+def get_host_cpu_model() -> str:
+    """
+    Retrieve CPU model of the host machine.
+    Used as fallback if benchmark output does not include it.
+    """
+    try:
+        # Linux: read from /proc/cpuinfo
+        with open('/proc/cpuinfo') as f:
+            for line in f:
+                if 'model name' in line:
+                    return line.split(':', 1)[1].strip()
+    except Exception:
+        pass
+
+    # Fallback
+    return platform.processor() or "Unknown"
+
 
 # ----------------------------------------------------------------------
 # Core functions
@@ -165,6 +195,12 @@ CMD ["./bench"]
     # Parse JSON output (expecting last line to be JSON)
     try:
         data = json.loads(output.strip().split('\n')[-1])
+        # Extract CPU model from benchmark output if present, otherwise fallback to host
+        cpu_model = data.get("cpu_model")
+        if not cpu_model:
+            cpu_model = get_host_cpu_model()
+            logger.debug(f"CPU model not in benchmark output, using host: {cpu_model}")
+
         # Convert to dataclass
         result = BenchmarkResult(
             compiler=combo.compiler,
@@ -172,13 +208,126 @@ CMD ["./bench"]
             opt_level=combo.opt_level,
             algorithm=combo.algorithm,
             encode=Throughput(samples_per_second=data["encode"]["samples_per_second"]),
-            decode=Throughput(samples_per_second=data["decode"]["samples_per_second"])
+            decode=Throughput(samples_per_second=data["decode"]["samples_per_second"]),
+            cpu_model=cpu_model
         )
         return result
     except (json.JSONDecodeError, IndexError, KeyError) as e:
         logger.error(f"Failed to parse JSON output: {e}")
         logger.error(f"Output was: {output}")
         return None
+
+
+def plot_results(results: List[BenchmarkResult], output_file: str = "benchmark_plot.png") -> None:
+    """
+    Generate bar plots for encode and decode.
+    X-axis: first all compiler+version combinations for 'tabular' algorithm,
+    then all for 'naive'. For each such combination, bars grouped by optimization level.
+    """
+    try:
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError as e:
+        logger.error(f"Missing required library for plotting: {e}")
+        logger.error("Install pandas and matplotlib: pip install pandas matplotlib")
+        sys.exit(1)
+
+    # Prepare mapping from (algorithm, compiler, version, opt_level) -> (encode, decode)
+    data_map = {}
+    comp_vers = set()
+    for r in results:
+        key = (r.algorithm, r.compiler, r.version, r.opt_level)
+        data_map[key] = (r.encode.samples_per_second, r.decode.samples_per_second)
+        comp_vers.add((r.compiler, r.version))
+
+    # Sort compilers (by compiler name then version)
+    sorted_comp_vers = sorted(comp_vers, key=lambda x: (x[0], x[1]))
+
+    # Fixed algorithm order: tabular first, then naive
+    algorithms = ["tabular", "naive"]
+
+    # Build list of x positions as tuples (algorithm, compiler, version)
+    x_tuples = []
+    for alg in algorithms:
+        for cv in sorted_comp_vers:
+            x_tuples.append((alg, cv[0], cv[1]))
+
+    n_positions = len(x_tuples)
+    opt_levels = sorted(set(key[3] for key in data_map.keys()))
+
+    # Prepare arrays for encode and decode values per optimization level
+    encode_vals = {opt: np.zeros(n_positions) for opt in opt_levels}
+    decode_vals = {opt: np.zeros(n_positions) for opt in opt_levels}
+
+    for i, (alg, comp, ver) in enumerate(x_tuples):
+        for opt in opt_levels:
+            key = (alg, comp, ver, opt)
+            if key in data_map:
+                enc, dec = data_map[key]
+                encode_vals[opt][i] = enc
+                decode_vals[opt][i] = dec
+
+    cpu_model = results[0].cpu_model if results else "Unknown"
+
+    # Create figure with two subplots (encode and decode)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(max(12, n_positions * 0.3), 10))
+    fig.suptitle(f"Benchmark Results - CPU: {cpu_model}", fontsize=16)
+
+    # Bar parameters
+    n_opts = len(opt_levels)
+    bar_width = 0.8 / n_opts
+    x = np.arange(n_positions)
+
+    # Plot encode
+    for j, opt in enumerate(opt_levels):
+        offset = (j - n_opts/2 + 0.5) * bar_width
+        ax1.bar(x + offset, encode_vals[opt], width=bar_width, label=opt)
+
+    ax1.set_ylabel('Encode (samples/s)')
+    ax1.set_title('Encode throughput')
+    ax1.set_xticks(x)
+    # Labels: only compiler+version (algorithm indicated by grouping)
+    labels = [f"{comp}{ver}" for (alg, comp, ver) in x_tuples]
+    ax1.set_xticklabels(labels, rotation=90)
+    ax1.legend(title='Optimization')
+
+    # Vertical separator between algorithm groups
+    n_per_alg = len(sorted_comp_vers)
+    if len(algorithms) > 1:
+        ax1.axvline(x=n_per_alg - 0.5, color='gray', linestyle='--', linewidth=1)
+
+    # Plot decode
+    for j, opt in enumerate(opt_levels):
+        offset = (j - n_opts/2 + 0.5) * bar_width
+        ax2.bar(x + offset, decode_vals[opt], width=bar_width, label=opt)
+
+    ax2.set_ylabel('Decode (samples/s)')
+    ax2.set_title('Decode throughput')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(labels, rotation=90)
+    ax2.legend(title='Optimization')
+    if len(algorithms) > 1:
+        ax2.axvline(x=n_per_alg - 0.5, color='gray', linestyle='--', linewidth=1)
+
+    # Add algorithm group labels above the plot
+    ax1.text(n_per_alg/2, ax1.get_ylim()[1]*1.02, 'tabular',
+             ha='center', va='bottom', fontweight='bold', fontsize=12)
+    ax1.text(n_per_alg + n_per_alg/2, ax1.get_ylim()[1]*1.02, 'naive',
+             ha='center', va='bottom', fontweight='bold', fontsize=12)
+
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=150)
+    logger.info(f"Plot saved to {output_file}")
+
+
+def export_results(results: List[BenchmarkResult], filename: str) -> None:
+    """Export results to a JSON file."""
+    # Convert dataclasses to dictionaries
+    data = [dataclasses.asdict(r) for r in results]
+    with open(filename, 'w') as f:
+        json.dump(data, f, indent=2)
+    logger.info(f"Results exported to {filename}")
 
 
 def main() -> None:
@@ -195,6 +344,10 @@ def main() -> None:
                         help="Algorithm implementations")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print build and run output (sets logging to DEBUG)")
+    parser.add_argument("--plot", action="store_true",
+                        help="Generate a static plot of results (requires pandas and matplotlib)")
+    parser.add_argument("--export", type=str, metavar="FILE",
+                        help="Export results to a JSON file")
     args = parser.parse_args()
 
     # Set logging level
@@ -224,13 +377,23 @@ def main() -> None:
         logger.error("No results obtained.")
         return
 
-    # Print markdown summary
-    print("\n## Summary (samples per second, higher is better)")
+    # Display summary
+    cpu_model = results[0].cpu_model
+    print(f"\nCPU: {cpu_model}")
+    print("## Summary (samples per second, higher is better)")
     print("| Compiler | Version | Opt | Algorithm | Encode (samples/s) | Decode (samples/s) |")
     print("|----------|---------|-----|-----------|--------------------|--------------------|")
     for r in results:
         print(f"| {r.compiler} | {r.version} | {r.opt_level} | {r.algorithm} | "
               f"{r.encode.samples_per_second:.2e} | {r.decode.samples_per_second:.2e} |")
+
+    # Export if requested
+    if args.export:
+        export_results(results, args.export)
+
+    # Plot if requested
+    if args.plot:
+        plot_results(results)
 
 
 if __name__ == "__main__":

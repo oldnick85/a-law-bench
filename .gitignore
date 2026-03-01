@@ -2,4 +2,5 @@
 /build*
 /external
 /out
-settings.json
+*.png
+*.json

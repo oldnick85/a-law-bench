@@ -4,3 +4,5 @@
 /out
 *.png
 *.json
+
+!doc/img/plot_example1.png

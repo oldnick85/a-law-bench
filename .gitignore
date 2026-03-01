@@ -2,4 +2,7 @@
 /build*
 /external
 /out
-settings.json
+*.png
+*.json
+
+!doc/img/plot_example1.png
